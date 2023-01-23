@@ -38,6 +38,10 @@ def _load_power_distribution(power_path, max_power=None):
         power_path - str, path to the (assumed .csv) data with the 
             power distribution from a particular wavefront snapshot
 
+        max_power - float, an optional limit to apply when importing
+            since the detector software occasionally likes to add 
+            anomalously large numbers at the edges of the beam
+
     OUTPUTS
 
         power_matrix - np.matrix, the power in a 2D array, including a
@@ -70,7 +74,7 @@ def _load_power_distribution(power_path, max_power=None):
         power_arr[np.where(power_arr > max_power)] = 0.0
 
     ### Crop around the actual data, and take a transpose so that the
-    ### first axis is actual the x-axis ('ij' indexing, as matplotlib
+    ### first axis is actually the x-axis ('ij' indexing, as matplotlib
     ### and numpy call it)
     power_arr = power_arr[:lens[1],:lens[0]].T
 
@@ -80,6 +84,65 @@ def _load_power_distribution(power_path, max_power=None):
     power_matrix = np.ma.masked_where(power_arr==0.0, power_arr)
 
     return power_matrix
+
+
+
+def _radial_crop(matrix, xcoord, ycoord, max_radius, center=None):
+    '''
+    Internal subroutine to crop the power distribution and/or 
+    wavefront measurements from data saved by the Thorlabs WFS, 
+    which sometimes does weird things and adds data that is not
+    visible on the GUI (and likely not even there)
+
+    INPUTS
+
+        matrix - np.matrix, the matrix to crop
+
+        xcoord - np.array, the horizontal (first axis of the matrix)
+            data points, used to center the naive radial cropping
+
+        ycoord - np.array, the vertical (second axis) data points
+            to center the cropping
+
+        max_radius - float, the cropping parameter to mask all data 
+            outside of a certain radius value (in mm). Sometimes 
+            the software adds numbers in the corners, outside of an
+            annular region of all zeros around a measured beam
+
+        center - 2-tuple of floats, origin about which to crop, 
+            usually assumed to be zero
+
+    OUTPUTS
+
+        cropped_matrix - the new matrix, with values adjusted to 0.0 
+            outside of the defined circle, and an updated internal 
+            mask object for consistency
+    '''
+
+    if center is None:
+        center = (0.0, 0.0)
+
+    ### Build a meshgrid of offset coordinates for easy calculation
+    ### of the radii and eventual cropping
+    xx, yy = np.meshgrid(xcoord - center[0], \
+                         ycoord - center[1], \
+                         indexing='ij')
+
+    ### Calculate the distance of each of the points from the imagined
+    ### center of the cropping circle
+    radii = np.sqrt(xx**2 + yy**2)
+
+    ### Define a boolean array for the points inside the desired crop
+    inside_circle = radii < max_radius
+
+    ### Build the new data and mask arrays
+    new_data = matrix.data * inside_circle
+    new_mask = np.logical_or(matrix.mask, np.logical_not(inside_circle))
+
+    ### Define a new numpy matrix object to return
+    new_matrix = np.ma.masked_where(new_mask, new_data)
+
+    return new_matrix
 
 
 
@@ -151,7 +214,8 @@ def _load_wavefront(meas_path):
 
 def load_wfs_data(meas_name='', meas_path='', power_path='', \
                   meas_suffix='_meas.csv', power_suffix='_power.csv', \
-                  load_power=True, max_power=None):
+                  load_power=True, max_power=None, max_radius=None, \
+                  crop_center=None):
     '''
     Load data from Thorlabs WFS series detectors, making many assumptions
     about the way the data is saved, both with regard to the CSV format
@@ -179,7 +243,13 @@ def load_wfs_data(meas_name='', meas_path='', power_path='', \
 
         load_power - boolean, option to load the power data or not
 
-        max_power - int, maximum value to cutoff
+        max_power - float, maximum value to cutoff
+
+        max_radius - float, radius of a circular crop applied to the power
+            data, in mm (physical units)
+
+        crop_center - 2-tuple of float (or other 2-index iterable), the 
+            origin about which to perform the circular crop
 
     OUTPUTS
 
@@ -230,10 +300,20 @@ def load_wfs_data(meas_name='', meas_path='', power_path='', \
     if load_power:
         power_matrix = _load_power_distribution(power_path, \
                                                 max_power=max_power)
+
+        ### Flip the axes if required. This should usually execute a
+        ### "yflip" if I remember correctly, but this general approach
+        ### will work for any potential software updates
         if xflip:
             power_matrix = power_matrix[::-1,:]
         if yflip:
             power_matrix = power_matrix[:,::-1]
+
+        ### If a max_radius was specified, crop the data as desired.
+        if max_radius is not None:
+            power_matrix = _radial_crop(power_matrix, xcoord, ycoord, \
+                                        max_radius, center=crop_center)
+
         return xcoord, ycoord, wavefront_matrix, power_matrix
     else:
         return xcoord, ycoord, wavefront_matrix
@@ -671,6 +751,8 @@ def fit_2d_gaussian(xcoord, ycoord, data_matrix, fix_theta=False, \
             ax.set_xlabel('X-coord [mm]', labelpad=10)
             ax.set_ylabel('Y-coord [mm]', labelpad=10)
 
+        ax3.set_zlabel('$\\Delta$ / Peak', labelpad=15)
+
         ### Label the two subplots appropriately
         ax1.set_title('Measured', fontsize=16)
         ax2.set_title('Reconstructed', fontsize=16)
@@ -743,7 +825,79 @@ def fit_2d_gaussian(xcoord, ycoord, data_matrix, fix_theta=False, \
 
 
 
-def smooth_wavefront(wavefront_matrix, sigma=1.0):
+def _pad_wavefront(wavefront_matrix, pad_length=5):
+
+    '''
+    Routine to resample a wavefront surface over a new set of points.
+
+    INPUTS
+
+        wavefront_matrix - matrix with data to be padded
+
+        pad_length - int, number of indices to pad
+
+    OUTPUTS
+
+        padded_data - np.ndarry, 
+        
+    '''
+
+    data_copy = np.copy(wavefront_matrix.data)
+    data_copy[wavefront_matrix.mask] = 0.0
+
+    ## Pad the data by looping over the mask rows and finding where
+    ## the edge is. The value of the wavefront at the edge is 
+    ## propagated outward along the axes, with some attempt to make
+    ## an average of the X and Y extrapolations
+    for i in range(wavefront_matrix.shape[0]):
+        for j in range(wavefront_matrix.shape[1]):
+            if not wavefront_matrix.mask[i,j]:
+                for k in range(pad_length):
+                    try:
+                        data_copy[i,j-k] = wavefront_matrix[i,j]
+                    except IndexError:
+                        break
+                break
+        for j in range(wavefront_matrix.shape[1])[::-1]:
+            if not wavefront_matrix.mask[i,j]:
+                for k in range(pad_length):
+                    try:
+                        data_copy[i,j+k] = wavefront_matrix[i,j]
+                    except IndexError:
+                        break
+                break
+
+    for j in range(wavefront_matrix.shape[1]):
+        for i in range(wavefront_matrix.shape[0]):
+            if not wavefront_matrix.mask[i,j]:
+                for k in range(pad_length):
+                    try:
+                        if data_copy[i-k,j]:
+                            data_copy[i-k,j] = np.mean(\
+                                    [wavefront_matrix[i,j], data_copy[i-k,j]])
+                        else:
+                            data_copy[i-k,j] = wavefront_matrix[i,j]
+                    except IndexError:
+                        break
+                break
+        for i in range(wavefront_matrix.shape[0])[::-1]:
+            if not wavefront_matrix.mask[i,j]:
+                for k in range(pad_length):
+                    try:
+                        if data_copy[i+k,j]:
+                            data_copy[i+k,j] = np.mean(\
+                                        [wavefront_matrix[i,j], data_copy[i+k,j]])
+                        else:
+                            data_copy[i+k,j] = wavefront_matrix[i,j]
+                    except IndexError:
+                        break
+                break
+
+    return data_copy
+
+
+
+def smooth_wavefront(wavefront_matrix, sigma=1.0, pad_length=5):
 
     '''
     Routine to resample a wavefront surface over a new set of points.
@@ -759,59 +913,14 @@ def smooth_wavefront(wavefront_matrix, sigma=1.0):
         
     '''
 
+    ### Make sure we're padding more than we're blurring, otherwise
+    ### the interpolator may do weird things at the end of the 
+    ### wavefront, since the data array has those values as zeros
+    ### in the absence of padding
+    if pad_length < sigma:
+        pad_length = int(np.ceil(sigma)) + 1
 
-    ### Build a copy so we can make in-place adjustments to the masked
-    ### values so the interpolator is well-behaved
-    data_copy = np.copy(wavefront_matrix.data)
-    data_copy[wavefront_matrix.mask] = 0.0
-
-    ## Pad the data by looping over the mask rows and finding where
-    ## the edge is. The value of the wavefront at the edge is 
-    ## propagated outward along the axes, with some attempt to make
-    ## an average of the X and Y extrapolations
-    for i in range(wavefront_matrix.shape[0]):
-        for j in range(wavefront_matrix.shape[1]):
-            if not wavefront_matrix.mask[i,j]:
-                for k in range(5):
-                    try:
-                        data_copy[i,j-k] = wavefront_matrix[i,j]
-                    except IndexError:
-                        break
-                break
-        for j in range(wavefront_matrix.shape[1])[::-1]:
-            if not wavefront_matrix.mask[i,j]:
-                for k in range(5):
-                    try:
-                        data_copy[i,j+k] = wavefront_matrix[i,j]
-                    except IndexError:
-                        break
-                break
-
-    for j in range(wavefront_matrix.shape[1]):
-        for i in range(wavefront_matrix.shape[0]):
-            if not wavefront_matrix.mask[i,j]:
-                for k in range(5):
-                    try:
-                        if data_copy[i-k,j]:
-                            data_copy[i-k,j] = np.mean(\
-                                    [wavefront_matrix[i,j], data_copy[i-k,j]])
-                        else:
-                            data_copy[i-k,j] = wavefront_matrix[i,j]
-                    except IndexError:
-                        break
-                break
-        for i in range(wavefront_matrix.shape[0])[::-1]:
-            if not wavefront_matrix.mask[i,j]:
-                for k in range(5):
-                    try:
-                        if data_copy[i+k,j]:
-                            data_copy[i+k,j] = np.mean(\
-                                        [wavefront_matrix[i,j], data_copy[i+k,j]])
-                        else:
-                            data_copy[i+k,j] = wavefront_matrix[i,j]
-                    except IndexError:
-                        break
-                break
+    data_copy = _pad_wavefront(wavefront_matrix, pad_length=pad_length)
 
     ### Blur the padded data and then re-apply the mask
     blur_arr = ndimage.gaussian_filter(data_copy, 1)
@@ -826,7 +935,8 @@ def smooth_wavefront(wavefront_matrix, sigma=1.0):
 
 
 def resample_wavefront(xcoord, ycoord, wavefront_matrix, \
-                       new_xcoord, new_ycoord, smoothing=0.0):
+                       new_xcoord, new_ycoord, sigma=1.0, \
+                       smoothing=0.0, pad_length=5):
     '''
     Routine to resample a wavefront surface over a new set of points.
 
@@ -847,53 +957,23 @@ def resample_wavefront(xcoord, ycoord, wavefront_matrix, \
 
         new_ycoord - ndarray, new Y-coordinates to sample
 
+        sigma - float, size of the gaussian blurring kernel to apply
+            before interpolating
+
+        smoothing - float, the smoothing factor applied to the 
+            bivariate spline interpolator
+
+        pad_length - int, number of indices to pad to help the 
+            interpolator be well-behaved at the edges
+
     OUTPUTS
         
     '''
 
-    ### Build a copy so we can make in-place adjustments to the masked
-    ### values so the interpolator is well-behaved
-    data_copy = np.copy(wavefront_matrix.data)
-    data_copy[wavefront_matrix.mask] = 0.0
-
-    ## Pad the data by looping over the mask rows and finding where
-    ## the edge is. The value of the wavefront at the edge is 
-    ## propagated outward along the axes, with some attempt to make
-    ## an average of the X and Y extrapolations
-    for i in range(wavefront_matrix.shape[0]):
-        for j in range(wavefront_matrix.shape[1]):
-            if not wavefront_matrix.mask[i,j]:
-                for k in range(5):
-                    data_copy[i,j-k] = wavefront_matrix[i,j]
-                break
-        for j in range(wavefront_matrix.shape[1])[::-1]:
-            if not wavefront_matrix.mask[i,j]:
-                for k in range(5):
-                    data_copy[i,j+k] = wavefront_matrix[i,j]
-                break
-
-    for j in range(wavefront_matrix.shape[1]):
-        for i in range(wavefront_matrix.shape[0]):
-            if not wavefront_matrix.mask[i,j]:
-                for k in range(5):
-                    if data_copy[i-k,j]:
-                        data_copy[i-k,j] = np.mean(\
-                                    [wavefront_matrix[i,j], data_copy[i-k,j]])
-                    else:
-                        data_copy[i-k,j] = wavefront_matrix[i,j]
-                break
-        for i in range(wavefront_matrix.shape[0])[::-1]:
-            if not wavefront_matrix.mask[i,j]:
-                for k in range(5):
-                    if data_copy[i+k,j]:
-                        data_copy[i+k,j] = np.mean(\
-                                    [wavefront_matrix[i,j], data_copy[i+k,j]])
-                    else:
-                        data_copy[i+k,j] = wavefront_matrix[i,j]
-                break
+    data_copy = _pad_wavefront(wavefront_matrix, pad_length=pad_length)
 
     ### Blur the padded data and then re-apply the mask
-    blur_arr = ndimage.gaussian_filter(data_copy, 1)
+    blur_arr = ndimage.gaussian_filter(data_copy, sigma)
 
     ### Interpolate the wavefront mask so we can resample this as well
     mask_interp = interpolate.RectBivariateSpline(\

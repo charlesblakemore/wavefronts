@@ -26,15 +26,16 @@ import matplotlib.pyplot as plt
 
 # meas_name = '20221026_7_5um_gbead/xy_test/xy_test_2'
 
-
 # meas_name = '20220822_input_beam_collimation/telescope_out_fullsize_z57cm'
 # meas_name = '20220822_input_beam_collimation/telescope_out_fullsize_z478_5cm_3mirror'
 
 # meas_name = '20221130_output_beam_collimation/initial_state/initial'
-meas_name = '20221130_output_beam_collimation/initial_state/initial_no_tele'
+# meas_name = '20221130_output_beam_collimation/initial_state/initial_no_tele'
 # meas_name = '20221130_output_beam_collimation/recollimation_lens/new_lens'
 # meas_name = '20221130_output_beam_collimation/recollimation_lens/new_lens_shim'
 # meas_name = '20221130_output_beam_collimation/recollimation_lens/new_lens_shim_vacuum'
+
+meas_name = '20230119_beam_alignment/input_beam_initial_48cm'
 
 shade_with_power = True
 colorbar = True
@@ -46,7 +47,8 @@ invert_curvature = False
 
 
 xcoord, ycoord, wavefront_matrix, power_matrix = \
-    wavefronts.load_wfs_data(meas_name=meas_name, max_power=5000)
+    wavefronts.load_wfs_data(meas_name=meas_name, max_power=7000, \
+                             max_radius=4.0)
 
 smooth_wavefront_matrix = wavefronts.smooth_wavefront(\
                                 wavefront_matrix, sigma=1)
@@ -55,8 +57,10 @@ smooth_power_matrix = wavefronts.smooth_wavefront(\
 
 extent = (np.min(xcoord), np.max(xcoord), np.min(ycoord), np.max(ycoord))
 
-# wavefronts.fit_2d_gaussian(xcoord, ycoord, power_matrix, plot=True)
-# wavefronts.fit_2d_gaussian(xcoord, ycoord, smooth_power_matrix, plot=True)
+wavefronts.fit_2d_gaussian(xcoord, ycoord, power_matrix, \
+                           print_fit=True, plot=True)
+wavefronts.fit_2d_gaussian(xcoord, ycoord, smooth_power_matrix, \
+                           print_fit=True, plot=True)
 
 wavefronts.plot_2d_power(xcoord, ycoord, smooth_power_matrix, colorbar=True, \
                          # xlim=(-2.5, 2.5), ylim=(-2.5, 2.5),

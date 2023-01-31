@@ -324,7 +324,8 @@ def load_wfs_data(meas_name='', meas_path='', power_path='', \
 def plot_3d_wavefront(xcoord, ycoord, wavefront_matrix, power_matrix=None,\
                       shade_with_power=False, invert=False, \
                       cmap='inferno', colorbar=True,\
-                      fig=None, ax=None, figsize=(11,8), show=True):
+                      fig=None, ax=None, figsize=(11,8), show=True, \
+                      save_fig=False, fig_name=None):
     '''
     Plot data from Thorlabs WFS series detectors as 3D surfaces, where the 
     topology is always set by the phase of the wavefront to aid in 
@@ -437,7 +438,8 @@ def plot_3d_wavefront(xcoord, ycoord, wavefront_matrix, power_matrix=None,\
 def plot_2d_power(xcoord, ycoord, power_matrix, \
                   cmap='inferno', colorbar=True, \
                   xlim=None, ylim=None, fig=None, ax=None, \
-                  figsize=(11,8), show=True):
+                  figsize=(11,8), show=True, \
+                  save_fig=False, fig_name=None):
     '''
     Plot data from Thorlabs WFS series detectors as 3D surfaces, where the 
     topology is always set by the phase of the wavefront to aid in 
@@ -582,7 +584,8 @@ def _gaussian_2d(x, y, A, x0, y0, sigmax, sigmay, theta, const):
 def fit_2d_gaussian(xcoord, ycoord, data_matrix, fix_theta=False, \
                     theta_init=0.0, fix_const=True, const_init=0.0, \
                     print_fit=False, plot=False, figsize=(14, 6), \
-                    resid_figsize=(8,6)):
+                    resid_figsize=(8,6), minos=False, \
+                    save_fig=False, fig_name=None):
     '''
     Routine to fit a 2-dimensional array to a 2D elliptical gaussian
     function, for instance to extract beam waist parameters or
@@ -692,7 +695,11 @@ def fit_2d_gaussian(xcoord, ycoord, data_matrix, fix_theta=False, \
     m.print_level = 0
 
     ### Minimize the cost function
-    result = m.migrad(ncall=100000)
+    result = m.migrad(ncall=10000)
+
+    if minos:
+        result = m.minos(ncall=10000)
+
     if print_fit:
         print(result)
 
@@ -760,12 +767,16 @@ def fit_2d_gaussian(xcoord, ycoord, data_matrix, fix_theta=False, \
 
         ### Align the Z-axis limits, since X- and Y-axis limts are 
         ### the same by construction
-        zlim1 = ax1.get_zlim3d()
-        zlim2 = ax2.get_zlim3d()
+        zlim1 = np.array(ax1.get_zlim3d())
+        zlim2 = np.array(ax2.get_zlim3d())
+        zlim1[0] = 0.0
+        zlim2[0] = 0.0
         if zlim1[1] >= zlim2[1]:
+            ax1.set_zlim3d(zlim1)
             ax2.set_zlim3d(zlim1)
         else:
             ax1.set_zlim3d(zlim2)
+            ax2.set_zlim3d(zlim2)
 
         fig.tight_layout()
         fig2.tight_layout()
@@ -825,10 +836,12 @@ def fit_2d_gaussian(xcoord, ycoord, data_matrix, fix_theta=False, \
 
 
 
-def _pad_wavefront(wavefront_matrix, pad_length=5):
+def _pad_wavefront_data(wavefront_matrix, pad_length=5):
 
     '''
-    Routine to resample a wavefront surface over a new set of points.
+    Internal routine to pad the wavefront data near the edges,
+    to help keep smoothing and interpolating functions
+    well-behaved.
 
     INPUTS
 
@@ -838,19 +851,21 @@ def _pad_wavefront(wavefront_matrix, pad_length=5):
 
     OUTPUTS
 
-        padded_data - np.ndarry, 
+        padded_data - np.ndarry, padded data from the 
+            wavefront_matrix input object
         
     '''
 
     data_copy = np.copy(wavefront_matrix.data)
     data_copy[wavefront_matrix.mask] = 0.0
 
-    ## Pad the data by looping over the mask rows and finding where
-    ## the edge is. The value of the wavefront at the edge is 
-    ## propagated outward along the axes, with some attempt to make
-    ## an average of the X and Y extrapolations
+    ### Pad the data by looping over the mask rows and finding where
+    ### the edge is. The value of the wavefront at the edge is 
+    ### propagated outward along the axes
     for i in range(wavefront_matrix.shape[0]):
         for j in range(wavefront_matrix.shape[1]):
+            ### It's a 'negative' mask, meaning invalid points outside 
+            ### the wavefront are masked, so valid points are zero
             if not wavefront_matrix.mask[i,j]:
                 for k in range(pad_length):
                     try:
@@ -858,6 +873,7 @@ def _pad_wavefront(wavefront_matrix, pad_length=5):
                     except IndexError:
                         break
                 break
+        ### Come from the end of the row
         for j in range(wavefront_matrix.shape[1])[::-1]:
             if not wavefront_matrix.mask[i,j]:
                 for k in range(pad_length):
@@ -867,6 +883,8 @@ def _pad_wavefront(wavefront_matrix, pad_length=5):
                         break
                 break
 
+    ### Do the same looping but for the columns, with some attempt 
+    ### to make an average of the X and Y extrapolations
     for j in range(wavefront_matrix.shape[1]):
         for i in range(wavefront_matrix.shape[0]):
             if not wavefront_matrix.mask[i,j]:
@@ -880,6 +898,7 @@ def _pad_wavefront(wavefront_matrix, pad_length=5):
                     except IndexError:
                         break
                 break
+        ### Loop from the bottom of the column
         for i in range(wavefront_matrix.shape[0])[::-1]:
             if not wavefront_matrix.mask[i,j]:
                 for k in range(pad_length):
@@ -900,16 +919,25 @@ def _pad_wavefront(wavefront_matrix, pad_length=5):
 def smooth_wavefront(wavefront_matrix, sigma=1.0, pad_length=5):
 
     '''
-    Routine to resample a wavefront surface over a new set of points.
+    Routine to smooth a wavefront with a gaussian blurring kernel.
+    Can effectively be used on the intensity distributions as well
 
     INPUTS
 
-        wavefront_matrix - ndarray, X-coordinates at which the 
-            data is sampled
+        wavefront_matrix - np.matrix, values of the wavefront phase
+            in a 2D matrix, likely with a mask
 
         sigma - float, kernel for the gaussian blurring
 
+        pad_length - int, number of data points to pad on the
+            wavefront boundary to make sure the interpolator is
+            well-behaved
+
     OUTPUTS
+
+        wavefront_matrix_n - np.matrix, values of the smoothed 
+            wavefront in a 2D matrix, with the same mask as the
+            input data
         
     '''
 
@@ -920,12 +948,11 @@ def smooth_wavefront(wavefront_matrix, sigma=1.0, pad_length=5):
     if pad_length < sigma:
         pad_length = int(np.ceil(sigma)) + 1
 
-    data_copy = _pad_wavefront(wavefront_matrix, pad_length=pad_length)
+    data_copy = _pad_wavefront_data(wavefront_matrix, pad_length=pad_length)
 
     ### Blur the padded data and then re-apply the mask
-    blur_arr = ndimage.gaussian_filter(data_copy, 1)
-
-    wavefront_arr_n = blur_arr * np.logical_not(wavefront_matrix.mask)
+    wavefront_arr_n = ndimage.gaussian_filter(data_copy, 1) \
+                            * np.logical_not(wavefront_matrix.mask)
     wavefront_matrix_n = np.ma.masked_where(\
                             wavefront_matrix.mask, wavefront_arr_n)
 
@@ -970,7 +997,7 @@ def resample_wavefront(xcoord, ycoord, wavefront_matrix, \
         
     '''
 
-    data_copy = _pad_wavefront(wavefront_matrix, pad_length=pad_length)
+    data_copy = _pad_wavefront_data(wavefront_matrix, pad_length=pad_length)
 
     ### Blur the padded data and then re-apply the mask
     blur_arr = ndimage.gaussian_filter(data_copy, sigma)
